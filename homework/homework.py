@@ -95,3 +95,154 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+import gzip
+import json
+import os
+
+import pickle
+import zipfile
+from glob import glob
+import pandas as pd  
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import SelectKBest, f_classif  
+from sklearn.linear_model import LogisticRegression  
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.model_selection import GridSearchCV 
+from sklearn.pipeline import Pipeline 
+
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+
+
+def load_data(input_directory):
+    dfs = []
+    routes = glob(f"{input_directory}/*")
+    for route in routes:
+        with zipfile.ZipFile(f"{route}", mode="r") as z:
+            for file in z.namelist():
+
+                with z.open(file) as f:
+                    dfs.append(pd.read_csv(f, sep=",", index_col=0))
+
+    return dfs
+
+
+def create_directory(output_directory):
+    if os.path.exists(output_directory):
+        for file in glob(f"{output_directory}/*"):
+            os.remove(file)
+        os.rmdir(output_directory)
+    os.makedirs(output_directory)
+
+
+def clean_df(df):
+    df = df.copy()
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.loc[df["MARRIAGE"] != 0]
+    df = df.loc[df["EDUCATION"] != 0]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
+    return df.dropna()
+
+
+def split_data(df):
+    return df.drop(columns=["default"]), df["default"]
+
+
+def pipeline():
+    cat_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    preprocessor = ColumnTransformer(
+        [
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_features),
+        ],
+        remainder=MinMaxScaler(),
+    )
+    return Pipeline(
+        [
+            ("preprocessor", preprocessor),
+            ("feature_selection", SelectKBest(score_func=f_classif, k=10)),
+            ("classifier", LogisticRegression(max_iter=1000, random_state=42)),
+        ]
+    )
+
+
+def estimator(pipeline):
+    param_grid = {
+        "feature_selection__k": range(1, 30),
+        "classifier__C": [0.001, 0.01, 0.1, 1, 10, 100],
+        "classifier__solver": ["liblinear"],
+    }
+
+    return GridSearchCV(
+        pipeline,
+        param_grid,
+        cv=10,
+        n_jobs=-1,
+        verbose=2,
+        refit=True,
+    )
+
+
+def save_model(path, estimator):
+    create_directory("files/models/")
+
+    with gzip.open(path, "wb") as f:
+        pickle.dump(estimator, f)
+
+
+def metrics(dataset_type, y_true, y_pred):
+    return {
+        "type": "metrics",
+        "dataset": dataset_type,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+def confusion(dataset_type, y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_type,
+        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+    }
+
+
+def main():
+    test_df, train_df = [clean_df(df) for df in load_data("files/input")]
+
+    x_train, y_train = split_data(train_df)
+    x_test, y_test = split_data(test_df)
+
+    pipeline = pipeline()
+
+    estimator = estimator(pipeline)
+    estimator.fit(x_train, y_train)
+
+    save_model(
+        os.path.join("files/models/", "model.pkl.gz"),
+        estimator,
+    )
+
+    create_directory("files/output/metrics/")
+
+    y_test_pred = estimator.predict(x_test)
+    test_precision_metrics = metrics("test", y_test, y_test_pred)
+    y_train_pred = estimator.predict(x_train)
+    train_precision_metrics = metrics("train", y_train, y_train_pred)
+
+    test_confusion_metrics = confusion("test", y_test, y_test_pred)
+    train_confusion_metrics = confusion("train", y_train, y_train_pred)
+
+    with open("files/output/metrics.json", "w", encoding="utf-8") as file:
+        file.write(json.dumps(train_precision_metrics) + "\n")
+        file.write(json.dumps(test_precision_metrics) + "\n")
+        file.write(json.dumps(train_confusion_metrics) + "\n")
+        file.write(json.dumps(test_confusion_metrics) + "\n")
+
+
+if __name__ == "__main__":
+    main()
